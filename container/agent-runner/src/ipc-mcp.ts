@@ -315,6 +315,93 @@ Use available_groups.json to find the JID for a group. The folder name should be
             }]
           };
         }
+      ),
+
+      tool(
+        'list_projects',
+        `List available projects that can be worked on. Projects must be configured in the mount allowlist on the host machine (${isMain ? 'you are main group' : 'you are NOT main group'}).`,
+        {},
+        async () => {
+          const projectsFile = path.join(IPC_DIR, 'available_projects.json');
+
+          try {
+            if (!fs.existsSync(projectsFile)) {
+              return {
+                content: [{
+                  type: 'text',
+                  text: 'No projects available. The host needs to configure allowed project roots in ~/.config/nanoclaw/mount-allowlist.json'
+                }]
+              };
+            }
+
+            const data = JSON.parse(fs.readFileSync(projectsFile, 'utf-8'));
+            const projects = data.projects || [];
+            const activeProject = data.activeProject || null;
+
+            if (projects.length === 0) {
+              return {
+                content: [{
+                  type: 'text',
+                  text: 'No projects configured. Add allowed roots to ~/.config/nanoclaw/mount-allowlist.json on the host.'
+                }]
+              };
+            }
+
+            const formatted = projects.map((p: { path: string; description?: string; allowReadWrite: boolean }) => {
+              const active = activeProject === p.path ? ' [ACTIVE]' : '';
+              const rw = p.allowReadWrite ? '(read-write)' : '(read-only)';
+              return `- ${p.path}${active} ${rw}${p.description ? ` - ${p.description}` : ''}`;
+            }).join('\n');
+
+            return {
+              content: [{
+                type: 'text',
+                text: `Available projects:\n${formatted}\n\nCurrent: ${activeProject || 'none'}\n\nUse set_project to switch.`
+              }]
+            };
+          } catch (err) {
+            return {
+              content: [{
+                type: 'text',
+                text: `Error reading projects: ${err instanceof Error ? err.message : String(err)}`
+              }]
+            };
+          }
+        }
+      ),
+
+      tool(
+        'set_project',
+        `Switch to a different project directory. The path must be under an allowed root configured in the host's mount allowlist. After switching, the container will restart and you'll be working in /workspace/project.`,
+        {
+          path: z.string().describe('Absolute path to the project (e.g., "~/code/myapp" or "/Users/me/projects/website")')
+        },
+        async (args) => {
+          // Validate path format
+          const projectPath = args.path.trim();
+          if (!projectPath) {
+            return {
+              content: [{ type: 'text', text: 'Project path cannot be empty.' }],
+              isError: true
+            };
+          }
+
+          const data = {
+            type: 'set_project',
+            projectPath,
+            groupFolder,
+            timestamp: new Date().toISOString()
+          };
+
+          writeIpcFile(TASKS_DIR, data);
+
+          return {
+            content: [{
+              type: 'text',
+              text: `Switching to project: ${projectPath}\n\nThe container will restart. Your next message will be in the new project context.`
+            }]
+          };
+        }
       )
     ]
   });

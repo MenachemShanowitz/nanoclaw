@@ -17,12 +17,17 @@ import {
   TRIGGER_PATTERN,
   MAIN_GROUP_FOLDER,
   IPC_POLL_INTERVAL,
-  TIMEZONE
+  TIMEZONE,
+  PERSISTENT_CONTAINER_MODE,
+  PROGRESS_MESSAGE_INTERVAL,
+  MAX_PROGRESS_MESSAGES
 } from './config.js';
 import { RegisteredGroup, Session, NewMessage } from './types.js';
 import { initDatabase, storeMessage, storeChatMetadata, getNewMessages, getMessagesSince, getAllTasks, getTaskById, updateChatName, getAllChats, getLastGroupSync, setLastGroupSync } from './db.js';
 import { startSchedulerLoop } from './task-scheduler.js';
 import { runContainerAgent, writeTasksSnapshot, writeGroupsSnapshot, AvailableGroup } from './container-runner.js';
+import { PersistentContainerManager, StreamMessage } from './persistent-container.js';
+import { loadMountAllowlist, validateMount } from './mount-security.js';
 import { loadJson, saveJson } from './utils.js';
 
 const GROUP_SYNC_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24 hours
@@ -38,6 +43,12 @@ let sessions: Session = {};
 let registeredGroups: Record<string, RegisteredGroup> = {};
 let lastAgentTimestamp: Record<string, string> = {};
 
+// Active project per group folder (path on host that gets mounted as /workspace/project)
+let activeProjects: Record<string, string> = {};
+
+// Persistent container manager for streaming support
+let persistentManager: PersistentContainerManager | null = null;
+
 async function setTyping(jid: string, isTyping: boolean): Promise<void> {
   try {
     await sock.sendPresenceUpdate(isTyping ? 'composing' : 'paused', jid);
@@ -48,16 +59,28 @@ async function setTyping(jid: string, isTyping: boolean): Promise<void> {
 
 function loadState(): void {
   const statePath = path.join(DATA_DIR, 'router_state.json');
-  const state = loadJson<{ last_timestamp?: string; last_agent_timestamp?: Record<string, string> }>(statePath, {});
+  const state = loadJson<{
+    last_timestamp?: string;
+    last_agent_timestamp?: Record<string, string>;
+    active_projects?: Record<string, string>;
+  }>(statePath, {});
   lastTimestamp = state.last_timestamp || '';
   lastAgentTimestamp = state.last_agent_timestamp || {};
+  activeProjects = state.active_projects || {};
   sessions = loadJson(path.join(DATA_DIR, 'sessions.json'), {});
   registeredGroups = loadJson(path.join(DATA_DIR, 'registered_groups.json'), {});
-  logger.info({ groupCount: Object.keys(registeredGroups).length }, 'State loaded');
+  logger.info({
+    groupCount: Object.keys(registeredGroups).length,
+    activeProjectCount: Object.keys(activeProjects).length
+  }, 'State loaded');
 }
 
 function saveState(): void {
-  saveJson(path.join(DATA_DIR, 'router_state.json'), { last_timestamp: lastTimestamp, last_agent_timestamp: lastAgentTimestamp });
+  saveJson(path.join(DATA_DIR, 'router_state.json'), {
+    last_timestamp: lastTimestamp,
+    last_agent_timestamp: lastAgentTimestamp,
+    active_projects: activeProjects
+  });
   saveJson(path.join(DATA_DIR, 'sessions.json'), sessions);
 }
 
@@ -111,6 +134,35 @@ async function syncGroupMetadata(force = false): Promise<void> {
 }
 
 /**
+ * Write available projects snapshot for the container to read.
+ * Shows projects from the mount allowlist that can be switched to.
+ */
+function writeProjectsSnapshot(groupFolder: string): void {
+  const allowlist = loadMountAllowlist();
+  const groupIpcDir = path.join(DATA_DIR, 'ipc', groupFolder);
+  fs.mkdirSync(groupIpcDir, { recursive: true });
+
+  const projects: Array<{ path: string; description?: string; allowReadWrite: boolean }> = [];
+
+  if (allowlist) {
+    for (const root of allowlist.allowedRoots) {
+      projects.push({
+        path: root.path,
+        description: root.description,
+        allowReadWrite: root.allowReadWrite
+      });
+    }
+  }
+
+  const projectsFile = path.join(groupIpcDir, 'available_projects.json');
+  fs.writeFileSync(projectsFile, JSON.stringify({
+    projects,
+    activeProject: activeProjects[groupFolder] || null,
+    lastSync: new Date().toISOString()
+  }, null, 2));
+}
+
+/**
  * Get available groups list for the agent.
  * Returns groups ordered by most recent activity.
  */
@@ -126,6 +178,99 @@ function getAvailableGroups(): AvailableGroup[] {
       lastActivity: c.last_message_time,
       isRegistered: registeredJids.has(c.jid)
     }));
+}
+
+/**
+ * Progress message batcher - throttles and batches streaming messages
+ * to avoid WhatsApp rate limiting while still providing real-time feedback
+ */
+class ProgressBatcher {
+  private pendingText: string[] = [];
+  private pendingTools: string[] = [];
+  private lastSendTime = 0;
+  private messageCount = 0;
+  private sendFn: (text: string) => Promise<void>;
+  private jid: string;
+  private flushTimeout: NodeJS.Timeout | null = null;
+
+  constructor(jid: string, sendFn: (text: string) => Promise<void>) {
+    this.jid = jid;
+    this.sendFn = sendFn;
+  }
+
+  async addProgress(msg: StreamMessage): Promise<void> {
+    if (msg.type === 'progress' && msg.text) {
+      this.pendingText.push(msg.text);
+    } else if (msg.type === 'tool' && msg.toolName) {
+      const toolStr = msg.toolInput
+        ? `${msg.toolName}: ${msg.toolInput}`
+        : msg.toolName;
+      this.pendingTools.push(toolStr);
+    }
+
+    // Check if we should send now
+    const now = Date.now();
+    const timeSinceLastSend = now - this.lastSendTime;
+
+    if (timeSinceLastSend >= PROGRESS_MESSAGE_INTERVAL && this.messageCount < MAX_PROGRESS_MESSAGES) {
+      await this.flush();
+    } else if (!this.flushTimeout) {
+      // Schedule a flush for later
+      const delay = Math.max(0, PROGRESS_MESSAGE_INTERVAL - timeSinceLastSend);
+      this.flushTimeout = setTimeout(() => this.flush(), delay);
+    }
+  }
+
+  async flush(): Promise<void> {
+    if (this.flushTimeout) {
+      clearTimeout(this.flushTimeout);
+      this.flushTimeout = null;
+    }
+
+    if (this.pendingText.length === 0 && this.pendingTools.length === 0) {
+      return;
+    }
+
+    if (this.messageCount >= MAX_PROGRESS_MESSAGES) {
+      // Clear pending but don't send (rate limited)
+      this.pendingText = [];
+      this.pendingTools = [];
+      return;
+    }
+
+    // Build progress message
+    const parts: string[] = [];
+
+    if (this.pendingTools.length > 0) {
+      // Format tools as a compact list
+      const toolsStr = this.pendingTools.map(t => `> ${t}`).join('\n');
+      parts.push(toolsStr);
+      this.pendingTools = [];
+    }
+
+    if (this.pendingText.length > 0) {
+      // Combine text, truncate if too long
+      let text = this.pendingText.join(' ').trim();
+      if (text.length > 500) {
+        text = text.slice(0, 497) + '...';
+      }
+      if (text) {
+        parts.push(text);
+      }
+      this.pendingText = [];
+    }
+
+    if (parts.length > 0) {
+      const message = `[working...]\n${parts.join('\n')}`;
+      try {
+        await this.sendFn(message);
+        this.messageCount++;
+        this.lastSendTime = Date.now();
+      } catch (err) {
+        logger.debug({ err, jid: this.jid }, 'Failed to send progress message');
+      }
+    }
+  }
 }
 
 async function processMessage(msg: NewMessage): Promise<void> {
@@ -187,6 +332,48 @@ async function runAgent(group: RegisteredGroup, prompt: string, chatJid: string)
   const availableGroups = getAvailableGroups();
   writeGroupsSnapshot(group.folder, isMain, availableGroups, new Set(Object.keys(registeredGroups)));
 
+  // Update available projects snapshot
+  writeProjectsSnapshot(group.folder);
+
+  // Use persistent containers with streaming for main group
+  if (PERSISTENT_CONTAINER_MODE && isMain && persistentManager) {
+    try {
+      const batcher = new ProgressBatcher(chatJid, async (text) => {
+        await sendMessage(chatJid, `${ASSISTANT_NAME}: ${text}`);
+      });
+
+      const result = await persistentManager.runMessage(
+        group.folder,
+        prompt,
+        sessionId,
+        chatJid,
+        false, // not a scheduled task
+        async (msg) => {
+          await batcher.addProgress(msg);
+        }
+      );
+
+      // Flush any remaining progress messages
+      await batcher.flush();
+
+      if (result.newSessionId) {
+        sessions[group.folder] = result.newSessionId;
+        saveJson(path.join(DATA_DIR, 'sessions.json'), sessions);
+      }
+
+      if (result.type === 'error' || result.status === 'error') {
+        logger.error({ group: group.name, error: result.error }, 'Container agent error');
+        return null;
+      }
+
+      return result.result || null;
+    } catch (err) {
+      logger.error({ group: group.name, err }, 'Persistent container error, falling back to one-shot');
+      // Fall through to one-shot mode
+    }
+  }
+
+  // One-shot mode (for non-main groups or fallback)
   try {
     const output = await runContainerAgent(group, {
       prompt,
@@ -323,6 +510,8 @@ async function processTaskIpc(
     folder?: string;
     trigger?: string;
     containerConfig?: RegisteredGroup['containerConfig'];
+    // For set_project
+    projectPath?: string;
   },
   sourceGroup: string,  // Verified identity from IPC directory
   isMain: boolean       // Verified from directory path
@@ -467,6 +656,59 @@ async function processTaskIpc(
       }
       break;
 
+    case 'set_project':
+      if (data.projectPath) {
+        // Validate the project path against the mount allowlist
+        const validation = validateMount(
+          { hostPath: data.projectPath, containerPath: 'project', readonly: false },
+          isMain
+        );
+
+        if (!validation.allowed) {
+          logger.warn({
+            sourceGroup,
+            projectPath: data.projectPath,
+            reason: validation.reason
+          }, 'Project path rejected by mount security');
+
+          // Send feedback to the user
+          const targetJid = Object.entries(registeredGroups).find(
+            ([, group]) => group.folder === sourceGroup
+          )?.[0];
+          if (targetJid) {
+            await sendMessage(targetJid, `${ASSISTANT_NAME}: Cannot switch to project: ${validation.reason}`);
+          }
+          break;
+        }
+
+        // Store the new active project
+        activeProjects[sourceGroup] = validation.realHostPath!;
+        saveState();
+        logger.info({
+          sourceGroup,
+          projectPath: validation.realHostPath
+        }, 'Active project changed');
+
+        // Restart the persistent container to pick up the new mount
+        if (persistentManager) {
+          const container = await persistentManager.getContainer(sourceGroup);
+          if (container) {
+            logger.info({ sourceGroup }, 'Restarting container for project change');
+            await container.shutdown();
+            // Container will auto-restart on next message
+          }
+        }
+
+        // Notify the user
+        const jid = Object.entries(registeredGroups).find(
+          ([, group]) => group.folder === sourceGroup
+        )?.[0];
+        if (jid) {
+          await sendMessage(jid, `${ASSISTANT_NAME}: Switched to project: ${validation.realHostPath}\nReady to work in /workspace/project`);
+        }
+      }
+      break;
+
     default:
       logger.warn({ type: data.type }, 'Unknown IPC task type');
   }
@@ -603,6 +845,28 @@ async function main(): Promise<void> {
   initDatabase();
   logger.info('Database initialized');
   loadState();
+
+  // Initialize persistent container manager
+  if (PERSISTENT_CONTAINER_MODE) {
+    persistentManager = new PersistentContainerManager(
+      () => registeredGroups,
+      () => activeProjects
+    );
+    logger.info('Persistent container mode enabled - real-time streaming active');
+  }
+
+  // Graceful shutdown
+  const shutdown = async () => {
+    logger.info('Shutting down...');
+    if (persistentManager) {
+      await persistentManager.shutdownAll();
+    }
+    process.exit(0);
+  };
+
+  process.on('SIGTERM', shutdown);
+  process.on('SIGINT', shutdown);
+
   await connectWhatsApp();
 }
 
