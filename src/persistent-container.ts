@@ -61,27 +61,35 @@ function getHomeDir(): string {
   return home;
 }
 
-function buildVolumeMounts(group: RegisteredGroup, isMain: boolean): VolumeMount[] {
+function buildVolumeMounts(group: RegisteredGroup, isMain: boolean, activeProject?: string): VolumeMount[] {
   const mounts: VolumeMount[] = [];
   const projectRoot = process.cwd();
 
-  if (isMain) {
+  // Active project mount - takes priority if set
+  if (activeProject && fs.existsSync(activeProject)) {
+    mounts.push({
+      hostPath: activeProject,
+      containerPath: '/workspace/project',
+      readonly: false
+    });
+  } else if (isMain) {
+    // Default for main: mount NanoClaw project itself
     mounts.push({
       hostPath: projectRoot,
       containerPath: '/workspace/project',
       readonly: false
     });
-    mounts.push({
-      hostPath: path.join(GROUPS_DIR, group.folder),
-      containerPath: '/workspace/group',
-      readonly: false
-    });
-  } else {
-    mounts.push({
-      hostPath: path.join(GROUPS_DIR, group.folder),
-      containerPath: '/workspace/group',
-      readonly: false
-    });
+  }
+
+  // Group folder mount
+  mounts.push({
+    hostPath: path.join(GROUPS_DIR, group.folder),
+    containerPath: '/workspace/group',
+    readonly: false
+  });
+
+  // Global folder for non-main groups
+  if (!isMain) {
     const globalDir = path.join(GROUPS_DIR, 'global');
     if (fs.existsSync(globalDir)) {
       mounts.push({
@@ -180,10 +188,13 @@ export class PersistentContainer {
   private isReady = false;
   private restartAttempts = 0;
   private maxRestartAttempts = 3;
+  private getActiveProject: () => string | undefined;
+  private currentProject: string | undefined;
 
-  constructor(group: RegisteredGroup, isMain: boolean) {
+  constructor(group: RegisteredGroup, isMain: boolean, getActiveProject: () => string | undefined) {
     this.group = group;
     this.isMain = isMain;
+    this.getActiveProject = getActiveProject;
   }
 
   async start(): Promise<void> {
@@ -195,7 +206,8 @@ export class PersistentContainer {
     const groupDir = path.join(GROUPS_DIR, this.group.folder);
     fs.mkdirSync(groupDir, { recursive: true });
 
-    const mounts = buildVolumeMounts(this.group, this.isMain);
+    this.currentProject = this.getActiveProject();
+    const mounts = buildVolumeMounts(this.group, this.isMain, this.currentProject);
     const containerArgs = buildContainerArgs(mounts);
 
     logger.info({
@@ -400,9 +412,14 @@ export class PersistentContainer {
 export class PersistentContainerManager {
   private containers = new Map<string, PersistentContainer>();
   private registeredGroups: () => Record<string, RegisteredGroup>;
+  private getActiveProjects: () => Record<string, string>;
 
-  constructor(getRegisteredGroups: () => Record<string, RegisteredGroup>) {
+  constructor(
+    getRegisteredGroups: () => Record<string, RegisteredGroup>,
+    getActiveProjects: () => Record<string, string>
+  ) {
     this.registeredGroups = getRegisteredGroups;
+    this.getActiveProjects = getActiveProjects;
   }
 
   async getContainer(groupFolder: string): Promise<PersistentContainer | null> {
@@ -419,7 +436,7 @@ export class PersistentContainerManager {
 
     let container = this.containers.get(groupFolder);
     if (!container) {
-      container = new PersistentContainer(group, isMain);
+      container = new PersistentContainer(group, isMain, () => this.getActiveProjects()[groupFolder]);
       this.containers.set(groupFolder, container);
     }
 

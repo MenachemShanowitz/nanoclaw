@@ -27,6 +27,7 @@ import { initDatabase, storeMessage, storeChatMetadata, getNewMessages, getMessa
 import { startSchedulerLoop } from './task-scheduler.js';
 import { runContainerAgent, writeTasksSnapshot, writeGroupsSnapshot, AvailableGroup } from './container-runner.js';
 import { PersistentContainerManager, StreamMessage } from './persistent-container.js';
+import { loadMountAllowlist, validateMount } from './mount-security.js';
 import { loadJson, saveJson } from './utils.js';
 
 const GROUP_SYNC_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24 hours
@@ -42,6 +43,9 @@ let sessions: Session = {};
 let registeredGroups: Record<string, RegisteredGroup> = {};
 let lastAgentTimestamp: Record<string, string> = {};
 
+// Active project per group folder (path on host that gets mounted as /workspace/project)
+let activeProjects: Record<string, string> = {};
+
 // Persistent container manager for streaming support
 let persistentManager: PersistentContainerManager | null = null;
 
@@ -55,16 +59,28 @@ async function setTyping(jid: string, isTyping: boolean): Promise<void> {
 
 function loadState(): void {
   const statePath = path.join(DATA_DIR, 'router_state.json');
-  const state = loadJson<{ last_timestamp?: string; last_agent_timestamp?: Record<string, string> }>(statePath, {});
+  const state = loadJson<{
+    last_timestamp?: string;
+    last_agent_timestamp?: Record<string, string>;
+    active_projects?: Record<string, string>;
+  }>(statePath, {});
   lastTimestamp = state.last_timestamp || '';
   lastAgentTimestamp = state.last_agent_timestamp || {};
+  activeProjects = state.active_projects || {};
   sessions = loadJson(path.join(DATA_DIR, 'sessions.json'), {});
   registeredGroups = loadJson(path.join(DATA_DIR, 'registered_groups.json'), {});
-  logger.info({ groupCount: Object.keys(registeredGroups).length }, 'State loaded');
+  logger.info({
+    groupCount: Object.keys(registeredGroups).length,
+    activeProjectCount: Object.keys(activeProjects).length
+  }, 'State loaded');
 }
 
 function saveState(): void {
-  saveJson(path.join(DATA_DIR, 'router_state.json'), { last_timestamp: lastTimestamp, last_agent_timestamp: lastAgentTimestamp });
+  saveJson(path.join(DATA_DIR, 'router_state.json'), {
+    last_timestamp: lastTimestamp,
+    last_agent_timestamp: lastAgentTimestamp,
+    active_projects: activeProjects
+  });
   saveJson(path.join(DATA_DIR, 'sessions.json'), sessions);
 }
 
@@ -115,6 +131,35 @@ async function syncGroupMetadata(force = false): Promise<void> {
   } catch (err) {
     logger.error({ err }, 'Failed to sync group metadata');
   }
+}
+
+/**
+ * Write available projects snapshot for the container to read.
+ * Shows projects from the mount allowlist that can be switched to.
+ */
+function writeProjectsSnapshot(groupFolder: string): void {
+  const allowlist = loadMountAllowlist();
+  const groupIpcDir = path.join(DATA_DIR, 'ipc', groupFolder);
+  fs.mkdirSync(groupIpcDir, { recursive: true });
+
+  const projects: Array<{ path: string; description?: string; allowReadWrite: boolean }> = [];
+
+  if (allowlist) {
+    for (const root of allowlist.allowedRoots) {
+      projects.push({
+        path: root.path,
+        description: root.description,
+        allowReadWrite: root.allowReadWrite
+      });
+    }
+  }
+
+  const projectsFile = path.join(groupIpcDir, 'available_projects.json');
+  fs.writeFileSync(projectsFile, JSON.stringify({
+    projects,
+    activeProject: activeProjects[groupFolder] || null,
+    lastSync: new Date().toISOString()
+  }, null, 2));
 }
 
 /**
@@ -286,6 +331,9 @@ async function runAgent(group: RegisteredGroup, prompt: string, chatJid: string)
   // Update available groups snapshot (main group only can see all groups)
   const availableGroups = getAvailableGroups();
   writeGroupsSnapshot(group.folder, isMain, availableGroups, new Set(Object.keys(registeredGroups)));
+
+  // Update available projects snapshot
+  writeProjectsSnapshot(group.folder);
 
   // Use persistent containers with streaming for main group
   if (PERSISTENT_CONTAINER_MODE && isMain && persistentManager) {
@@ -462,6 +510,8 @@ async function processTaskIpc(
     folder?: string;
     trigger?: string;
     containerConfig?: RegisteredGroup['containerConfig'];
+    // For set_project
+    projectPath?: string;
   },
   sourceGroup: string,  // Verified identity from IPC directory
   isMain: boolean       // Verified from directory path
@@ -606,6 +656,59 @@ async function processTaskIpc(
       }
       break;
 
+    case 'set_project':
+      if (data.projectPath) {
+        // Validate the project path against the mount allowlist
+        const validation = validateMount(
+          { hostPath: data.projectPath, containerPath: 'project', readonly: false },
+          isMain
+        );
+
+        if (!validation.allowed) {
+          logger.warn({
+            sourceGroup,
+            projectPath: data.projectPath,
+            reason: validation.reason
+          }, 'Project path rejected by mount security');
+
+          // Send feedback to the user
+          const targetJid = Object.entries(registeredGroups).find(
+            ([, group]) => group.folder === sourceGroup
+          )?.[0];
+          if (targetJid) {
+            await sendMessage(targetJid, `${ASSISTANT_NAME}: Cannot switch to project: ${validation.reason}`);
+          }
+          break;
+        }
+
+        // Store the new active project
+        activeProjects[sourceGroup] = validation.realHostPath!;
+        saveState();
+        logger.info({
+          sourceGroup,
+          projectPath: validation.realHostPath
+        }, 'Active project changed');
+
+        // Restart the persistent container to pick up the new mount
+        if (persistentManager) {
+          const container = await persistentManager.getContainer(sourceGroup);
+          if (container) {
+            logger.info({ sourceGroup }, 'Restarting container for project change');
+            await container.shutdown();
+            // Container will auto-restart on next message
+          }
+        }
+
+        // Notify the user
+        const jid = Object.entries(registeredGroups).find(
+          ([, group]) => group.folder === sourceGroup
+        )?.[0];
+        if (jid) {
+          await sendMessage(jid, `${ASSISTANT_NAME}: Switched to project: ${validation.realHostPath}\nReady to work in /workspace/project`);
+        }
+      }
+      break;
+
     default:
       logger.warn({ type: data.type }, 'Unknown IPC task type');
   }
@@ -745,7 +848,10 @@ async function main(): Promise<void> {
 
   // Initialize persistent container manager
   if (PERSISTENT_CONTAINER_MODE) {
-    persistentManager = new PersistentContainerManager(() => registeredGroups);
+    persistentManager = new PersistentContainerManager(
+      () => registeredGroups,
+      () => activeProjects
+    );
     logger.info('Persistent container mode enabled - real-time streaming active');
   }
 
