@@ -20,6 +20,16 @@ export const CONTAINER_TIMEOUT = parseInt(process.env.CONTAINER_TIMEOUT || '3000
 export const CONTAINER_MAX_OUTPUT_SIZE = parseInt(process.env.CONTAINER_MAX_OUTPUT_SIZE || '10485760', 10); // 10MB default
 export const IPC_POLL_INTERVAL = 1000;
 
+// Persistent container mode: keeps containers alive between messages for faster response
+// and enables real-time progress streaming to WhatsApp
+export const PERSISTENT_CONTAINER_MODE = process.env.PERSISTENT_CONTAINER_MODE !== '0';
+
+// Minimum interval between progress messages to avoid WhatsApp rate limiting (ms)
+export const PROGRESS_MESSAGE_INTERVAL = parseInt(process.env.PROGRESS_MESSAGE_INTERVAL || '3000', 10);
+
+// Maximum number of progress messages per request (to avoid spam)
+export const MAX_PROGRESS_MESSAGES = parseInt(process.env.MAX_PROGRESS_MESSAGES || '10', 10);
+
 function escapeRegex(str: string): string {
   return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }

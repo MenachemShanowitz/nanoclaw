@@ -1,14 +1,17 @@
 /**
  * NanoClaw Agent Runner
  * Runs inside a container, receives config via stdin, outputs result to stdout
+ * Supports both one-shot mode and persistent mode with streaming
  */
 
 import fs from 'fs';
 import path from 'path';
+import readline from 'readline';
 import { query, HookCallback, PreCompactHookInput } from '@anthropic-ai/claude-agent-sdk';
 import { createIpcMcp } from './ipc-mcp.js';
 
 interface ContainerInput {
+  type?: 'message' | 'ping' | 'shutdown';
   prompt: string;
   sessionId?: string;
   groupFolder: string;
@@ -24,6 +27,18 @@ interface ContainerOutput {
   error?: string;
 }
 
+// Streaming protocol messages
+interface StreamMessage {
+  type: 'progress' | 'tool' | 'result' | 'error' | 'pong';
+  text?: string;
+  toolName?: string;
+  toolInput?: string;
+  status?: 'success' | 'error';
+  result?: string | null;
+  newSessionId?: string;
+  error?: string;
+}
+
 interface SessionEntry {
   sessionId: string;
   fullPath: string;
@@ -34,6 +49,8 @@ interface SessionEntry {
 interface SessionsIndex {
   entries: SessionEntry[];
 }
+
+const PERSISTENT_MODE = process.env.NANOCLAW_PERSISTENT === '1';
 
 async function readStdin(): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -54,12 +71,15 @@ function writeOutput(output: ContainerOutput): void {
   console.log(OUTPUT_END_MARKER);
 }
 
+function writeStream(msg: StreamMessage): void {
+  console.log(JSON.stringify(msg));
+}
+
 function log(message: string): void {
   console.error(`[agent-runner] ${message}`);
 }
 
 function getSessionSummary(sessionId: string, transcriptPath: string): string | null {
-  // sessions-index.json is in the same directory as the transcript
   const projectDir = path.dirname(transcriptPath);
   const indexPath = path.join(projectDir, 'sessions-index.json');
 
@@ -81,9 +101,6 @@ function getSessionSummary(sessionId: string, transcriptPath: string): string | 
   return null;
 }
 
-/**
- * Archive the full transcript to conversations/ before compaction.
- */
 function createPreCompactHook(): HookCallback {
   return async (input, _toolUseId, _context) => {
     const preCompact = input as PreCompactHookInput;
@@ -200,22 +217,129 @@ function formatTranscriptMarkdown(messages: ParsedMessage[], title?: string | nu
   return lines.join('\n');
 }
 
-async function main(): Promise<void> {
-  let input: ContainerInput;
+/**
+ * Run agent with streaming output
+ */
+async function runAgentStreaming(input: ContainerInput): Promise<void> {
+  const ipcMcp = createIpcMcp({
+    chatJid: input.chatJid,
+    groupFolder: input.groupFolder,
+    isMain: input.isMain
+  });
 
-  try {
-    const stdinData = await readStdin();
-    input = JSON.parse(stdinData);
-    log(`Received input for group: ${input.groupFolder}`);
-  } catch (err) {
-    writeOutput({
-      status: 'error',
-      result: null,
-      error: `Failed to parse input: ${err instanceof Error ? err.message : String(err)}`
-    });
-    process.exit(1);
+  let result: string | null = null;
+  let newSessionId: string | undefined;
+  let lastTextOutput = '';
+
+  let prompt = input.prompt;
+  if (input.isScheduledTask) {
+    prompt = `[SCHEDULED TASK - You are running automatically, not in response to a user message. Use mcp__nanoclaw__send_message if needed to communicate with the user.]\n\n${input.prompt}`;
   }
 
+  try {
+    log('Starting agent with streaming...');
+
+    for await (const message of query({
+      prompt,
+      options: {
+        cwd: '/workspace/group',
+        resume: input.sessionId,
+        allowedTools: [
+          'Bash',
+          'Read', 'Write', 'Edit', 'Glob', 'Grep',
+          'WebSearch', 'WebFetch',
+          'mcp__nanoclaw__*'
+        ],
+        permissionMode: 'bypassPermissions',
+        allowDangerouslySkipPermissions: true,
+        settingSources: ['project'],
+        mcpServers: {
+          nanoclaw: ipcMcp
+        },
+        hooks: {
+          PreCompact: [{ hooks: [createPreCompactHook()] }]
+        }
+      }
+    })) {
+      if (message.type === 'system' && message.subtype === 'init') {
+        newSessionId = message.session_id;
+        log(`Session initialized: ${newSessionId}`);
+      }
+
+      // Stream assistant text output
+      if (message.type === 'assistant' && message.message?.content) {
+        for (const block of message.message.content) {
+          if (block.type === 'text' && block.text) {
+            // Only stream new text (avoid duplicates)
+            const newText = block.text;
+            if (newText !== lastTextOutput && newText.length > lastTextOutput.length) {
+              // Get the incremental part
+              const increment = newText.startsWith(lastTextOutput)
+                ? newText.slice(lastTextOutput.length)
+                : newText;
+              if (increment.trim()) {
+                writeStream({ type: 'progress', text: increment });
+              }
+              lastTextOutput = newText;
+            }
+          } else if (block.type === 'tool_use') {
+            // Stream tool usage for visibility
+            const toolName = block.name;
+            let toolInput = '';
+
+            // Format tool input for display
+            if (typeof block.input === 'object') {
+              if ('command' in block.input) {
+                toolInput = String(block.input.command);
+              } else if ('file_path' in block.input) {
+                toolInput = String(block.input.file_path);
+              } else if ('pattern' in block.input) {
+                toolInput = String(block.input.pattern);
+              } else if ('query' in block.input) {
+                toolInput = String(block.input.query);
+              } else if ('url' in block.input) {
+                toolInput = String(block.input.url);
+              }
+            }
+
+            writeStream({
+              type: 'tool',
+              toolName,
+              toolInput: toolInput.slice(0, 200) // Truncate long inputs
+            });
+          }
+        }
+      }
+
+      if ('result' in message && message.result) {
+        result = message.result as string;
+      }
+    }
+
+    log('Agent completed successfully');
+    writeStream({
+      type: 'result',
+      status: 'success',
+      result,
+      newSessionId
+    });
+
+  } catch (err) {
+    const errorMessage = err instanceof Error ? err.message : String(err);
+    log(`Agent error: ${errorMessage}`);
+    writeStream({
+      type: 'error',
+      status: 'error',
+      error: errorMessage,
+      newSessionId
+    });
+  }
+}
+
+/**
+ * Run agent in one-shot mode (original behavior)
+ */
+async function runAgentOneShot(input: ContainerInput): Promise<void> {
   const ipcMcp = createIpcMcp({
     chatJid: input.chatJid,
     groupFolder: input.groupFolder,
@@ -225,7 +349,6 @@ async function main(): Promise<void> {
   let result: string | null = null;
   let newSessionId: string | undefined;
 
-  // Add context for scheduled tasks
   let prompt = input.prompt;
   if (input.isScheduledTask) {
     prompt = `[SCHEDULED TASK - You are running automatically, not in response to a user message. Use mcp__nanoclaw__send_message if needed to communicate with the user.]\n\n${input.prompt}`;
@@ -283,6 +406,81 @@ async function main(): Promise<void> {
       error: errorMessage
     });
     process.exit(1);
+  }
+}
+
+/**
+ * Persistent mode: read messages in a loop
+ */
+async function runPersistentMode(): Promise<void> {
+  log('Starting in persistent mode');
+
+  const rl = readline.createInterface({
+    input: process.stdin,
+    output: process.stdout,
+    terminal: false
+  });
+
+  for await (const line of rl) {
+    if (!line.trim()) continue;
+
+    try {
+      const input: ContainerInput = JSON.parse(line);
+
+      if (input.type === 'ping') {
+        writeStream({ type: 'pong' });
+        continue;
+      }
+
+      if (input.type === 'shutdown') {
+        log('Shutdown requested');
+        rl.close();
+        process.exit(0);
+      }
+
+      // Handle message
+      if (input.type === 'message' || !input.type) {
+        log(`Processing message for group: ${input.groupFolder}`);
+        await runAgentStreaming(input);
+      }
+
+    } catch (err) {
+      log(`Error processing input: ${err instanceof Error ? err.message : String(err)}`);
+      writeStream({
+        type: 'error',
+        error: `Failed to process input: ${err instanceof Error ? err.message : String(err)}`
+      });
+    }
+  }
+}
+
+/**
+ * One-shot mode: read single input from stdin
+ */
+async function runOneShotMode(): Promise<void> {
+  let input: ContainerInput;
+
+  try {
+    const stdinData = await readStdin();
+    input = JSON.parse(stdinData);
+    log(`Received input for group: ${input.groupFolder}`);
+  } catch (err) {
+    writeOutput({
+      status: 'error',
+      result: null,
+      error: `Failed to parse input: ${err instanceof Error ? err.message : String(err)}`
+    });
+    process.exit(1);
+  }
+
+  await runAgentOneShot(input);
+}
+
+async function main(): Promise<void> {
+  if (PERSISTENT_MODE) {
+    await runPersistentMode();
+  } else {
+    await runOneShotMode();
   }
 }
 

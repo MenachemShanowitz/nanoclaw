@@ -17,12 +17,16 @@ import {
   TRIGGER_PATTERN,
   MAIN_GROUP_FOLDER,
   IPC_POLL_INTERVAL,
-  TIMEZONE
+  TIMEZONE,
+  PERSISTENT_CONTAINER_MODE,
+  PROGRESS_MESSAGE_INTERVAL,
+  MAX_PROGRESS_MESSAGES
 } from './config.js';
 import { RegisteredGroup, Session, NewMessage } from './types.js';
 import { initDatabase, storeMessage, storeChatMetadata, getNewMessages, getMessagesSince, getAllTasks, getTaskById, updateChatName, getAllChats, getLastGroupSync, setLastGroupSync } from './db.js';
 import { startSchedulerLoop } from './task-scheduler.js';
 import { runContainerAgent, writeTasksSnapshot, writeGroupsSnapshot, AvailableGroup } from './container-runner.js';
+import { PersistentContainerManager, StreamMessage } from './persistent-container.js';
 import { loadJson, saveJson } from './utils.js';
 
 const GROUP_SYNC_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24 hours
@@ -37,6 +41,9 @@ let lastTimestamp = '';
 let sessions: Session = {};
 let registeredGroups: Record<string, RegisteredGroup> = {};
 let lastAgentTimestamp: Record<string, string> = {};
+
+// Persistent container manager for streaming support
+let persistentManager: PersistentContainerManager | null = null;
 
 async function setTyping(jid: string, isTyping: boolean): Promise<void> {
   try {
@@ -128,6 +135,99 @@ function getAvailableGroups(): AvailableGroup[] {
     }));
 }
 
+/**
+ * Progress message batcher - throttles and batches streaming messages
+ * to avoid WhatsApp rate limiting while still providing real-time feedback
+ */
+class ProgressBatcher {
+  private pendingText: string[] = [];
+  private pendingTools: string[] = [];
+  private lastSendTime = 0;
+  private messageCount = 0;
+  private sendFn: (text: string) => Promise<void>;
+  private jid: string;
+  private flushTimeout: NodeJS.Timeout | null = null;
+
+  constructor(jid: string, sendFn: (text: string) => Promise<void>) {
+    this.jid = jid;
+    this.sendFn = sendFn;
+  }
+
+  async addProgress(msg: StreamMessage): Promise<void> {
+    if (msg.type === 'progress' && msg.text) {
+      this.pendingText.push(msg.text);
+    } else if (msg.type === 'tool' && msg.toolName) {
+      const toolStr = msg.toolInput
+        ? `${msg.toolName}: ${msg.toolInput}`
+        : msg.toolName;
+      this.pendingTools.push(toolStr);
+    }
+
+    // Check if we should send now
+    const now = Date.now();
+    const timeSinceLastSend = now - this.lastSendTime;
+
+    if (timeSinceLastSend >= PROGRESS_MESSAGE_INTERVAL && this.messageCount < MAX_PROGRESS_MESSAGES) {
+      await this.flush();
+    } else if (!this.flushTimeout) {
+      // Schedule a flush for later
+      const delay = Math.max(0, PROGRESS_MESSAGE_INTERVAL - timeSinceLastSend);
+      this.flushTimeout = setTimeout(() => this.flush(), delay);
+    }
+  }
+
+  async flush(): Promise<void> {
+    if (this.flushTimeout) {
+      clearTimeout(this.flushTimeout);
+      this.flushTimeout = null;
+    }
+
+    if (this.pendingText.length === 0 && this.pendingTools.length === 0) {
+      return;
+    }
+
+    if (this.messageCount >= MAX_PROGRESS_MESSAGES) {
+      // Clear pending but don't send (rate limited)
+      this.pendingText = [];
+      this.pendingTools = [];
+      return;
+    }
+
+    // Build progress message
+    const parts: string[] = [];
+
+    if (this.pendingTools.length > 0) {
+      // Format tools as a compact list
+      const toolsStr = this.pendingTools.map(t => `> ${t}`).join('\n');
+      parts.push(toolsStr);
+      this.pendingTools = [];
+    }
+
+    if (this.pendingText.length > 0) {
+      // Combine text, truncate if too long
+      let text = this.pendingText.join(' ').trim();
+      if (text.length > 500) {
+        text = text.slice(0, 497) + '...';
+      }
+      if (text) {
+        parts.push(text);
+      }
+      this.pendingText = [];
+    }
+
+    if (parts.length > 0) {
+      const message = `[working...]\n${parts.join('\n')}`;
+      try {
+        await this.sendFn(message);
+        this.messageCount++;
+        this.lastSendTime = Date.now();
+      } catch (err) {
+        logger.debug({ err, jid: this.jid }, 'Failed to send progress message');
+      }
+    }
+  }
+}
+
 async function processMessage(msg: NewMessage): Promise<void> {
   const group = registeredGroups[msg.chat_jid];
   if (!group) return;
@@ -187,6 +287,45 @@ async function runAgent(group: RegisteredGroup, prompt: string, chatJid: string)
   const availableGroups = getAvailableGroups();
   writeGroupsSnapshot(group.folder, isMain, availableGroups, new Set(Object.keys(registeredGroups)));
 
+  // Use persistent containers with streaming for main group
+  if (PERSISTENT_CONTAINER_MODE && isMain && persistentManager) {
+    try {
+      const batcher = new ProgressBatcher(chatJid, async (text) => {
+        await sendMessage(chatJid, `${ASSISTANT_NAME}: ${text}`);
+      });
+
+      const result = await persistentManager.runMessage(
+        group.folder,
+        prompt,
+        sessionId,
+        chatJid,
+        false, // not a scheduled task
+        async (msg) => {
+          await batcher.addProgress(msg);
+        }
+      );
+
+      // Flush any remaining progress messages
+      await batcher.flush();
+
+      if (result.newSessionId) {
+        sessions[group.folder] = result.newSessionId;
+        saveJson(path.join(DATA_DIR, 'sessions.json'), sessions);
+      }
+
+      if (result.type === 'error' || result.status === 'error') {
+        logger.error({ group: group.name, error: result.error }, 'Container agent error');
+        return null;
+      }
+
+      return result.result || null;
+    } catch (err) {
+      logger.error({ group: group.name, err }, 'Persistent container error, falling back to one-shot');
+      // Fall through to one-shot mode
+    }
+  }
+
+  // One-shot mode (for non-main groups or fallback)
   try {
     const output = await runContainerAgent(group, {
       prompt,
@@ -603,6 +742,25 @@ async function main(): Promise<void> {
   initDatabase();
   logger.info('Database initialized');
   loadState();
+
+  // Initialize persistent container manager
+  if (PERSISTENT_CONTAINER_MODE) {
+    persistentManager = new PersistentContainerManager(() => registeredGroups);
+    logger.info('Persistent container mode enabled - real-time streaming active');
+  }
+
+  // Graceful shutdown
+  const shutdown = async () => {
+    logger.info('Shutting down...');
+    if (persistentManager) {
+      await persistentManager.shutdownAll();
+    }
+    process.exit(0);
+  };
+
+  process.on('SIGTERM', shutdown);
+  process.on('SIGINT', shutdown);
+
   await connectWhatsApp();
 }
 
