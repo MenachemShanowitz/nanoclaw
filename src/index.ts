@@ -2,8 +2,10 @@ import makeWASocket, {
   useMultiFileAuthState,
   DisconnectReason,
   makeCacheableSignalKeyStore,
+  downloadMediaMessage,
   WASocket
 } from '@whiskeysockets/baileys';
+import { proto } from '@whiskeysockets/baileys';
 import pino from 'pino';
 import { exec, execSync } from 'child_process';
 import fs from 'fs';
@@ -14,6 +16,7 @@ import {
   POLL_INTERVAL,
   STORE_DIR,
   DATA_DIR,
+  GROUPS_DIR,
   TRIGGER_PATTERN,
   MAIN_GROUP_FOLDER,
   IPC_POLL_INTERVAL,
@@ -31,6 +34,101 @@ import { loadMountAllowlist, validateMount } from './mount-security.js';
 import { loadJson, saveJson } from './utils.js';
 
 const GROUP_SYNC_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24 hours
+
+// Media download support
+const MIME_EXTENSIONS: Record<string, string> = {
+  'image/jpeg': '.jpg',
+  'image/png': '.png',
+  'image/webp': '.webp',
+  'image/gif': '.gif',
+  'video/mp4': '.mp4',
+  'video/3gpp': '.3gp',
+  'audio/ogg; codecs=opus': '.ogg',
+  'audio/mpeg': '.mp3',
+  'audio/mp4': '.m4a',
+  'application/pdf': '.pdf',
+  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': '.xlsx',
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document': '.docx',
+  'application/vnd.openxmlformats-officedocument.presentationml.presentation': '.pptx',
+  'text/csv': '.csv',
+  'text/plain': '.txt',
+};
+
+/**
+ * Detect and extract media info from a WhatsApp message.
+ * Returns null if the message has no downloadable media.
+ */
+function getMediaInfo(msg: proto.IWebMessageInfo): { mimetype: string; fileName?: string } | null {
+  const m = msg.message;
+  if (!m) return null;
+
+  if (m.imageMessage) {
+    return { mimetype: m.imageMessage.mimetype || 'image/jpeg' };
+  }
+  if (m.videoMessage) {
+    return { mimetype: m.videoMessage.mimetype || 'video/mp4' };
+  }
+  if (m.audioMessage) {
+    return { mimetype: m.audioMessage.mimetype || 'audio/ogg; codecs=opus' };
+  }
+  if (m.documentMessage) {
+    return {
+      mimetype: m.documentMessage.mimetype || 'application/octet-stream',
+      fileName: m.documentMessage.fileName || undefined
+    };
+  }
+  if (m.stickerMessage) {
+    return { mimetype: m.stickerMessage.mimetype || 'image/webp' };
+  }
+  return null;
+}
+
+/**
+ * Download media from a WhatsApp message and save it to the group's files directory.
+ * Returns the media info (type + host path) or null if download fails.
+ */
+async function downloadAndSaveMedia(
+  msg: proto.IWebMessageInfo,
+  groupFolder: string
+): Promise<{ type: string; hostPath: string; containerPath: string; fileName: string } | null> {
+  const info = getMediaInfo(msg);
+  if (!info) return null;
+
+  try {
+    const buffer = await downloadMediaMessage(msg, 'buffer', {}) as Buffer;
+
+    // Determine filename
+    const ext = MIME_EXTENSIONS[info.mimetype] || '';
+    const baseName = info.fileName || `${msg.key.id || Date.now()}${ext}`;
+    // Sanitize filename
+    const safeName = baseName.replace(/[^a-zA-Z0-9._-]/g, '_');
+
+    const filesDir = path.join(GROUPS_DIR, groupFolder, 'files');
+    fs.mkdirSync(filesDir, { recursive: true });
+
+    const hostPath = path.join(filesDir, safeName);
+    fs.writeFileSync(hostPath, buffer);
+
+    const containerPath = `/workspace/group/files/${safeName}`;
+
+    logger.info({
+      group: groupFolder,
+      type: info.mimetype,
+      fileName: safeName,
+      size: buffer.length
+    }, 'Media downloaded');
+
+    return {
+      type: info.mimetype,
+      hostPath,
+      containerPath,
+      fileName: safeName
+    };
+  } catch (err) {
+    logger.error({ group: groupFolder, err }, 'Failed to download media');
+    return null;
+  }
+}
 
 const logger = pino({
   level: process.env.LOG_LEVEL || 'info',
@@ -287,14 +385,21 @@ async function processMessage(msg: NewMessage): Promise<void> {
   const sinceTimestamp = lastAgentTimestamp[msg.chat_jid] || '';
   const missedMessages = getMessagesSince(msg.chat_jid, sinceTimestamp, ASSISTANT_NAME);
 
+  const escapeXml = (s: string) => s
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+
   const lines = missedMessages.map(m => {
-    // Escape XML special characters in content
-    const escapeXml = (s: string) => s
-      .replace(/&/g, '&amp;')
-      .replace(/</g, '&lt;')
-      .replace(/>/g, '&gt;')
-      .replace(/"/g, '&quot;');
-    return `<message sender="${escapeXml(m.sender_name)}" time="${m.timestamp}">${escapeXml(m.content)}</message>`;
+    let inner = '';
+    if (m.media_path && m.media_type) {
+      inner += `<file path="${escapeXml(m.media_path)}" type="${escapeXml(m.media_type)}" />`;
+    }
+    if (m.content) {
+      inner += escapeXml(m.content);
+    }
+    return `<message sender="${escapeXml(m.sender_name)}" time="${m.timestamp}">${inner}</message>`;
   });
   const prompt = `<messages>\n${lines.join('\n')}\n</messages>`;
 
@@ -769,7 +874,7 @@ async function connectWhatsApp(): Promise<void> {
 
   sock.ev.on('creds.update', saveCreds);
 
-  sock.ev.on('messages.upsert', ({ messages }) => {
+  sock.ev.on('messages.upsert', async ({ messages }) => {
     for (const msg of messages) {
       if (!msg.message) continue;
       const chatJid = msg.key.remoteJid;
@@ -781,8 +886,18 @@ async function connectWhatsApp(): Promise<void> {
       storeChatMetadata(chatJid, timestamp);
 
       // Only store full message content for registered groups
-      if (registeredGroups[chatJid]) {
-        storeMessage(msg, chatJid, msg.key.fromMe || false, msg.pushName || undefined);
+      const group = registeredGroups[chatJid];
+      if (group) {
+        // Download media if present
+        let media: { type: string; path: string } | undefined;
+        if (getMediaInfo(msg)) {
+          const result = await downloadAndSaveMedia(msg, group.folder);
+          if (result) {
+            media = { type: result.type, path: result.containerPath };
+          }
+        }
+
+        storeMessage(msg, chatJid, msg.key.fromMe || false, msg.pushName || undefined, media);
       }
     }
   });
